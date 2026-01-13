@@ -197,47 +197,73 @@ app.get('/api/sensores/:mac', async (req, res) => {
         const { mac } = req.params;
         const { period = '24h', limit } = req.query;
 
-        let logsQuery = supabase.from('telemetry_logs').select('*').eq('mac', mac).order('ts', { ascending: false });
+        // 1. Busca os logs (Histórico)
+        // O select('*') já traz latitude, longitude e altitude se existirem na tabela
+        let logsQuery = supabase
+            .from('telemetry_logs')
+            .select('*')
+            .eq('mac', mac)
+            .order('ts', { ascending: false });
 
+        // Filtro de período
         if (period !== 'all') {
             const agora = new Date();
             let dataInicio;
             if (period === '1h') dataInicio = new Date(agora.getTime() - 3600000);
             else if (period === '24h') dataInicio = new Date(agora.getTime() - 86400000);
             else if (period === '7d') dataInicio = new Date(agora.getTime() - 604800000);
+            
             if (dataInicio) logsQuery = logsQuery.gte('ts', dataInicio.toISOString());
         }
 
         if (limit) logsQuery = logsQuery.limit(parseInt(limit));
 
+        // 2. Busca as configurações do sensor
         const configQuery = supabase.from('sensor_configs').select('*').eq('mac', mac).maybeSingle();
 
+        // Executa em paralelo
         const [logsResult, configResult] = await Promise.all([logsQuery, configQuery]);
 
         if (logsResult.error) throw logsResult.error;
         if (configResult.error) throw configResult.error;
 
-        // Downsampling de 10 minutos
         const rawLogs = logsResult.data || [];
+        
+        // 3. Processamento de Downsampling (Opcional: mantém lógica de 10 min)
         const filteredLogs = [];
         let lastKeptTime = 0;
         const TEN_MINUTES_MS = 10 * 60 * 1000;
 
         for (const log of rawLogs) {
             const logTime = new Date(log.ts).getTime();
-            if (lastKeptTime === 0 || Math.abs(lastKeptTime - logTime) >= TEN_MINUTES_MS) {
+            // Mantém o primeiro log (mais recente) e depois aplica o intervalo
+            if (filteredLogs.length === 0 || Math.abs(lastKeptTime - logTime) >= TEN_MINUTES_MS) {
                 filteredLogs.push(log);
                 lastKeptTime = logTime;
             }
         }
 
-        const sensorInfo = configResult.data || {
+        // 4. Monta o objeto INFO
+        let sensorInfo = configResult.data || {
             mac: mac,
             display_name: 'Sensor Não Configurado',
             batt_warning: 20,
             temp_max: 0,
             hum_max: 0
         };
+
+        // --- ATUALIZAÇÃO IMPORTANTE ---
+        // Pegamos a latitude/longitude/altitude do log MAIS RECENTE (rawLogs[0])
+        // e injetamos no objeto 'info' para facilitar o uso no mapa.
+        if (rawLogs.length > 0) {
+            const latest = rawLogs[0];
+            sensorInfo = {
+                ...sensorInfo,
+                latitude: latest.latitude ?? latest.lat,   // Tenta 'latitude', fallback para 'lat'
+                longitude: latest.longitude ?? latest.lng, // Tenta 'longitude', fallback para 'lng'
+                altitude: latest.altitude ?? 0
+            };
+        }
 
         return res.status(200).json({ info: sensorInfo, history: filteredLogs });
 
