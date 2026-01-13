@@ -2,25 +2,24 @@ import express from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
+import XLSX from 'xlsx'; // <--- NOVA IMPORTAÇÃO (SheetJS)
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Configuração do Supabase
+// --- CONFIGURAÇÃO DO SUPABASE ---
 const supabase = createClient(
     process.env.SUPABASE_URL, 
     process.env.SUPABASE_KEY
 );
 
-// Middlewares
+// --- MIDDLEWARES GERAIS ---
 app.use(cors());
 app.use(express.json());
 
-/**
- * MIDDLEWARE DE SEGURANÇA (API KEY)
- */
+// --- MIDDLEWARE DE SEGURANÇA (API KEY) ---
 const authMiddleware = (req, res, next) => {
     const userApiKey = req.header('x-api-key');
     const masterApiKey = process.env.API_KEY;
@@ -33,15 +32,13 @@ const authMiddleware = (req, res, next) => {
     next();
 };
 
-// Aplica a proteção em todas as rotas /api
 app.use('/api', authMiddleware);
 
-// --- ENDPOINTS DE DISPOSITIVOS ---
 
-/**
- * GET /api/dispositivos
- * Retorna Gateways e Sensores vinculados, cruzando com a tabela de configurações.
- */
+// ==================================================================
+// ROTAS DE DISPOSITIVOS
+// ==================================================================
+
 app.get('/api/dispositivos', async (req, res) => {
     try {
         const { data: logs, error: logError } = await supabase.from('telemetry_logs').select('gw, mac');
@@ -56,13 +53,11 @@ app.get('/api/dispositivos', async (req, res) => {
             if (!acc.mapa.has(idUnico)) {
                 acc.mapa.add(idUnico);
                 const config = configMap.get(current.mac) || {};
-                
                 acc.lista.push({ 
                     gw: current.gw, 
                     mac: current.mac,
                     display_name: config.display_name || 'Novo Sensor',
                     batt_warning: config.batt_warning || 20,
-                    // Devolvemos para o front como max_temp/max_hum para manter compatibilidade
                     max_temp: config.temp_max || 0,
                     max_hum: config.hum_max || 0
                 });
@@ -76,15 +71,11 @@ app.get('/api/dispositivos', async (req, res) => {
     }
 });
 
-// PATCH SEGURO E SIMPLIFICADO
 app.patch('/api/dispositivos', async (req, res) => {
     try {
-     
         const { mac, display_name, batt_warning, temp_max, hum_max, max_temp, max_hum } = req.body;
-
         if (!mac) return res.status(400).json({ error: 'MAC Obrigatório' });
 
-        // Normalização dos dados (resolve nomes trocados e garante números)
         const payload = {
             mac: mac,
             display_name: display_name,
@@ -94,79 +85,38 @@ app.patch('/api/dispositivos', async (req, res) => {
             updated_at: new Date().toISOString()
         };
 
-        // Envio para o banco
         const { data, error } = await supabase
             .from('sensor_configs')
             .upsert(payload, { onConflict: 'mac' })
             .select();
 
-        if (error) {
-            console.error("❌ Erro Supabase:", JSON.stringify(error));
-            throw error; // Joga para o catch
-        }
-
-        return res.status(200).json({ message: 'Salvo!', data: data[0] });
-
-    } catch (error) {
-        console.error("❌ Erro 500:", error);
-        return res.status(500).json({ 
-            error: error.message || "Erro desconhecido ao salvar."
-        });
-    }
-});
-
-// --- ENDPOINTS DE TELEMETRIA ---
-
-app.get('/api/sensores', async (req, res) => {
-    try {
-        const { mac, start, end } = req.query;
-        let query = supabase.from('telemetry_logs').select('*').order('ts', { ascending: false });
-
-        if (mac) query = query.eq('mac', mac);
-        if (start) query = query.gte('ts', start);
-        if (end) query = query.lte('ts', end);
-
-        const { data, error } = await query;
         if (error) throw error;
-        return res.status(200).json(data);
+        return res.status(200).json({ message: 'Configuração salva!', data: data[0] });
+
     } catch (error) {
         return res.status(500).json({ error: error.message });
     }
 });
 
-/**
- * GET /api/sensores/latest
- * Retorna a última leitura de cada sensor + o Nome (display_name).
- */
+
+// ==================================================================
+// ROTAS DE TELEMETRIA
+// ==================================================================
+
 app.get('/api/sensores/latest', async (req, res) => {
     try {
-        // 1. Busca os logs ordenados por data (mais recente primeiro)
-        const { data: logs, error: logError } = await supabase
-            .from('telemetry_logs')
-            .select('*')
-            .order('ts', { ascending: false });
-
-        // 2. Busca as configurações (para pegar os nomes)
-        const { data: configs, error: configError } = await supabase
-            .from('sensor_configs')
-            .select('mac, display_name');
+        const { data: logs, error: logError } = await supabase.from('telemetry_logs').select('*').order('ts', { ascending: false });
+        const { data: configs } = await supabase.from('sensor_configs').select('mac, display_name');
 
         if (logError) throw logError;
-        // Se der erro no config, não paramos, apenas seguimos sem nomes, 
-        // mas idealmente poderíamos lançar erro aqui também.
 
-        // 3. Cria um Mapa de Nomes para acesso rápido
-        // Ex: { "BC:57...": "Câmera Fria 01" }
         const configMap = new Map(configs?.map(c => [c.mac, c.display_name]) || []);
 
-        // 4. Processa a lista para pegar apenas o único mais recente de cada MAC
         const uniqueLatest = Array.from(
             logs.reduce((map, item) => {
-                // Se este MAC ainda não está no mapa, adicionamos (pois é o mais recente devido ao sort)
                 if (!map.has(item.mac)) {
                     map.set(item.mac, {
-                        ...item, // Copia todos os dados do log (temp, hum, rssi, etc)
-                        // Adiciona o nome vindo do configMap, ou um padrão se não existir
+                        ...item,
                         display_name: configMap.get(item.mac) || 'Sensor Sem Nome'
                     });
                 }
@@ -174,9 +124,7 @@ app.get('/api/sensores/latest', async (req, res) => {
             }, new Map()).values()
         );
 
-        // Opcional: Reordenar por nome ou mac para ficar bonito no front
-        uniqueLatest.sort((a, b) => a.mac.localeCompare(b.mac));
-
+        uniqueLatest.sort((a, b) => a.display_name.localeCompare(b.display_name));
         return res.status(200).json(uniqueLatest);
     } catch (error) {
         return res.status(500).json({ error: error.message });
@@ -184,53 +132,105 @@ app.get('/api/sensores/latest', async (req, res) => {
 });
 
 /**
- * GET /api/sensores/:mac
- * Retorna:
- * 1. As configurações do sensor (Info)
- * 2. O histórico de leituras (History)
+ * GET /api/sensor/report
+ * Retorna um arquivo EXCEL (.xlsx) pronto para download.
  */
+app.get('/api/sensor/report', async (req, res) => {
+    try {
+        const { mac, startDate, endDate } = req.query;
+
+        if (!mac || !startDate || !endDate) {
+            return res.status(400).json({ error: 'Faltam parâmetros: mac, startDate, endDate' });
+        }
+
+        // 1. Busca Dados no Banco
+        const { data, error } = await supabase
+            .from('telemetry_logs')
+            .select('*')
+            .eq('mac', mac)
+            .gte('ts', startDate)
+            .lte('ts', endDate)
+            .order('ts', { ascending: true }); // Cronológico
+
+        if (error) throw error;
+
+        if (!data || data.length === 0) {
+            return res.status(404).json({ error: 'Nenhum dado encontrado para este período.' });
+        }
+
+        // 2. Formata os dados para o Excel (Renomeia colunas)
+        const excelData = data.map(item => ({
+            "Data/Hora": new Date(item.ts).toLocaleString('pt-BR'), // Formata data bonita
+            "Temperatura (°C)": item.temp,
+            "Umidade (%)": item.hum,
+            "Bateria (%)": item.batt,
+            "Gateway": item.gw,
+            "RSSI (dBm)": item.rssi,
+            "Sensor MAC": item.mac
+        }));
+
+        // 3. Cria a Planilha (WorkSheet) e o Livro (WorkBook)
+        const workSheet = XLSX.utils.json_to_sheet(excelData);
+        const workBook = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(workBook, workSheet, "Relatorio");
+
+        // 4. Gera o Buffer binário do arquivo
+        const buffer = XLSX.write(workBook, { type: 'buffer', bookType: 'xlsx' });
+
+        // 5. Define headers para Download do Excel
+        const filename = `relatorio_${mac.replace(/:/g, '')}_${Date.now()}.xlsx`;
+
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+
+        // 6. Envia o buffer
+        return res.send(buffer);
+
+    } catch (error) {
+        console.error('Erro no report excel:', error);
+        return res.status(500).json({ error: error.message });
+    }
+});
+
 app.get('/api/sensores/:mac', async (req, res) => {
     try {
         const { mac } = req.params;
         const { period = '24h', limit } = req.query;
 
-        // --- PREPARAÇÃO DA QUERY DE LOGS (HISTÓRICO) ---
-        let logsQuery = supabase
-            .from('telemetry_logs')
-            .select('*')
-            .eq('mac', mac)
-            .order('ts', { ascending: false });
+        let logsQuery = supabase.from('telemetry_logs').select('*').eq('mac', mac).order('ts', { ascending: false });
 
-        // Filtro de Período
         if (period !== 'all') {
             const agora = new Date();
             let dataInicio;
             if (period === '1h') dataInicio = new Date(agora.getTime() - 3600000);
             else if (period === '24h') dataInicio = new Date(agora.getTime() - 86400000);
             else if (period === '7d') dataInicio = new Date(agora.getTime() - 604800000);
-            
             if (dataInicio) logsQuery = logsQuery.gte('ts', dataInicio.toISOString());
         }
 
-        // Limite de registros
         if (limit) logsQuery = logsQuery.limit(parseInt(limit));
 
-        // --- PREPARAÇÃO DA QUERY DE CONFIG (INFO) ---
-        const configQuery = supabase
-            .from('sensor_configs')
-            .select('*')
-            .eq('mac', mac)
-            .maybeSingle(); // maybeSingle não dá erro se não achar (retorna null)
+        const configQuery = supabase.from('sensor_configs').select('*').eq('mac', mac).maybeSingle();
 
-        // --- EXECUÇÃO EM PARALELO (Mais rápido) ---
         const [logsResult, configResult] = await Promise.all([logsQuery, configQuery]);
 
-        // Verificação de erros
         if (logsResult.error) throw logsResult.error;
         if (configResult.error) throw configResult.error;
 
-        // --- MONTAGEM DA RESPOSTA ---
-        // Se não tiver config salva, criamos um objeto padrão para o front não quebrar
+        // Downsampling de 10 minutos
+        const rawLogs = logsResult.data || [];
+        const filteredLogs = [];
+        let lastKeptTime = 0;
+        const TEN_MINUTES_MS = 10 * 60 * 1000;
+
+        for (const log of rawLogs) {
+            const logTime = new Date(log.ts).getTime();
+            if (lastKeptTime === 0 || Math.abs(lastKeptTime - logTime) >= TEN_MINUTES_MS) {
+                filteredLogs.push(log);
+                lastKeptTime = logTime;
+            }
+        }
+
         const sensorInfo = configResult.data || {
             mac: mac,
             display_name: 'Sensor Não Configurado',
@@ -239,10 +239,7 @@ app.get('/api/sensores/:mac', async (req, res) => {
             hum_max: 0
         };
 
-        return res.status(200).json({
-            info: sensorInfo,     // Dados estáticos (Nome, Alertas)
-            history: logsResult.data // Dados temporais (Gráfico)
-        });
+        return res.status(200).json({ info: sensorInfo, history: filteredLogs });
 
     } catch (error) {
         return res.status(500).json({ error: error.message });
