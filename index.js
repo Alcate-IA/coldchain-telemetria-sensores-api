@@ -192,6 +192,44 @@ app.get('/api/sensor/report', async (req, res) => {
     }
 });
 
+/**
+ * GET /api/sensor/coordinates
+ * Retorna coordenadas (lat, lng, alt) de um sensor em um período.
+ */
+app.get('/api/sensor/coordinates', async (req, res) => {
+    try {
+        const { mac, startDate, endDate } = req.query;
+
+        if (!mac || !startDate || !endDate) {
+            return res.status(400).json({ error: 'Faltam parâmetros: mac, startDate, endDate' });
+        }
+
+        const { data, error } = await supabase
+            .from('telemetry_logs')
+            .select('*')
+            .eq('mac', mac)
+            .gte('ts', startDate)
+            .lte('ts', endDate)
+            .order('ts', { ascending: true });
+
+        if (error) throw error;
+
+        const coordinates = data
+            .map(item => ({
+                ts: item.ts,
+                lat: item.latitude ?? item.lat,
+                lng: item.longitude ?? item.lng,
+                alt: item.altitude ?? 0
+            }))
+            .filter(c => c.lat != null && c.lng != null);
+
+        return res.status(200).json(coordinates);
+
+    } catch (error) {
+        return res.status(500).json({ error: error.message });
+    }
+});
+
 app.get('/api/sensores/:mac', async (req, res) => {
     try {
         const { mac } = req.params;
