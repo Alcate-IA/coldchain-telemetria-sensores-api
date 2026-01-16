@@ -73,15 +73,28 @@ app.get('/api/dispositivos', async (req, res) => {
 
 app.patch('/api/dispositivos', async (req, res) => {
     try {
-        const { mac, display_name, batt_warning, temp_max, hum_max, max_temp, max_hum } = req.body;
+        // 1. Recebe o novo campo do corpo da requisição
+        const { 
+            mac, 
+            display_name, 
+            batt_warning, 
+            temp_max, 
+            hum_max, 
+            max_temp, 
+            max_hum, 
+            sensor_porta_vinculado 
+        } = req.body;
+
         if (!mac) return res.status(400).json({ error: 'MAC Obrigatório' });
 
         const payload = {
             mac: mac,
             display_name: display_name,
             batt_warning: Number(batt_warning || 20),
-            temp_max: Number(temp_max !== undefined ? temp_max : (max_temp || 0)),
-            hum_max: Number(hum_max !== undefined ? hum_max : (max_hum || 0)),
+            temp_max: Number(temp_max !== undefined ? temp_max : (max_temp || null)),
+            hum_max: Number(hum_max !== undefined ? hum_max : (max_hum || null)),
+            sensor_porta_vinculado: sensor_porta_vinculado || null, 
+            
             updated_at: new Date().toISOString()
         };
 
@@ -98,35 +111,69 @@ app.patch('/api/dispositivos', async (req, res) => {
     }
 });
 
-
 // ==================================================================
 // ROTAS DE TELEMETRIA
 // ==================================================================
 
 app.get('/api/sensores/latest', async (req, res) => {
     try {
-        const { data: logs, error: logError } = await supabase.from('telemetry_logs').select('*').order('ts', { ascending: false });
-        const { data: configs } = await supabase.from('sensor_configs').select('mac, display_name');
+        // 1. Busca logs da VIEW OTIMIZADA (Agora é rápido e não traz histórico inútil)
+        const { data: logs, error: logError } = await supabase
+            .from('view_latest_telemetry') 
+            .select('*');
+
+        // 2. Busca Configurações
+        const { data: configs, error: configError } = await supabase
+            .from('sensor_configs')
+            .select('mac, display_name, sensor_porta_vinculado');
+
+        // 3. Busca status das portas (View otimizada)
+        const { data: doorLogs, error: doorError } = await supabase
+            .from('view_latest_door_status')
+            .select('*');
 
         if (logError) throw logError;
+        if (configError) throw configError;
+        if (doorError) throw doorError;
 
-        const configMap = new Map(configs?.map(c => [c.mac, c.display_name]) || []);
+        // --- MAPAS DE BUSCA RÁPIDA ---
+        const configMap = new Map(configs?.map(c => [c.mac, c]) || []);
+        
+        // Mapa usando 'sensor_mac' como chave
+        const doorMap = new Map(doorLogs?.map(d => [d.sensor_mac, d]) || []);
 
-        const uniqueLatest = Array.from(
-            logs.reduce((map, item) => {
-                if (!map.has(item.mac)) {
-                    map.set(item.mac, {
-                        ...item,
-                        display_name: configMap.get(item.mac) || 'Sensor Sem Nome'
-                    });
+        // --- PROCESSAMENTO (Agora é apenas um map simples, sem reduce pesado) ---
+        const result = logs.map(item => {
+            const config = configMap.get(item.mac) || {};
+            const macPortaVinculada = config.sensor_porta_vinculado;
+            
+            let dadosPorta = null;
+
+            // Lógica de Vinculação
+            if (macPortaVinculada) {
+                const statusPorta = doorMap.get(macPortaVinculada);
+                if (statusPorta) {
+                    dadosPorta = {
+                        is_open: statusPorta.is_open
+                    };
                 }
-                return map;
-            }, new Map()).values()
-        );
+            }
 
-        uniqueLatest.sort((a, b) => a.display_name.localeCompare(b.display_name));
-        return res.status(200).json(uniqueLatest);
+            return {
+                ...item,
+                display_name: config.display_name || 'Sensor Sem Nome',
+                sensor_porta_vinculado: macPortaVinculada || null,
+                status_porta: dadosPorta
+            };
+        });
+
+        // Ordenação alfabética
+        result.sort((a, b) => a.display_name.localeCompare(b.display_name));
+        
+        return res.status(200).json(result);
+
     } catch (error) {
+        console.error("Erro na API Latest:", error);
         return res.status(500).json({ error: error.message });
     }
 });
@@ -304,6 +351,54 @@ app.get('/api/sensores/:mac', async (req, res) => {
         }
 
         return res.status(200).json({ info: sensorInfo, history: filteredLogs });
+
+    } catch (error) {
+        return res.status(500).json({ error: error.message });
+    }
+});
+
+
+// ==================================================================
+// ROTAS DE PORTAS (DOOR LOGS)
+// ==================================================================
+
+app.get('/api/doors/latest', async (req, res) => {
+    try {
+        // 1. Busca os últimos registros direto da View Otimizada
+        const { data: logs, error: logError } = await supabase
+            .from('view_latest_door_status')
+            .select('*');
+
+        if (logError) throw logError;
+
+        // 2. Opcional: Busca configurações extras se houver (ex: bateria minima)
+        // Ajustado para usar 'sensor_mac' e não buscar 'display_name'
+        const { data: configs, error: configError } = await supabase
+            .from('sensor_configs')
+            .select('sensor_mac'); 
+            // Adicione outros campos aqui se existirem, ex: 'batt_warning'
+
+        // Cria um Set de MACs configurados para saber se o sensor é conhecido
+        const macsConfigurados = new Set(configs?.map(c => c.sensor_mac) || []);
+
+        // 3. Monta o objeto final
+        const result = logs.map(log => {
+            const isKnown = macsConfigurados.has(log.sensor_mac);
+
+            return {
+                ...log,
+                // Como não existe display_name, usamos o MAC formatado
+                display_name: `Porta ${log.sensor_mac}`, 
+                status_text: log.is_open ? 'ABERTO' : 'FECHADO',
+                status_color: log.is_open ? 'red' : 'green',
+                is_configured: isKnown // Flag útil para o frontend saber se é um sensor "novo"
+            };
+        });
+
+        // Ordena pelo MAC para manter a lista estável
+        result.sort((a, b) => a.sensor_mac.localeCompare(b.sensor_mac));
+
+        return res.status(200).json(result);
 
     } catch (error) {
         return res.status(500).json({ error: error.message });
