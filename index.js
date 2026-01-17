@@ -59,7 +59,8 @@ app.get('/api/dispositivos', async (req, res) => {
                     display_name: config.display_name || 'Novo Sensor',
                     batt_warning: config.batt_warning || 20,
                     max_temp: config.temp_max || 0,
-                    max_hum: config.hum_max || 0
+                    max_hum: config.hum_max || 0,
+                    em_manutencao: !!config.em_manutencao
                 });
             }
             return acc;
@@ -82,7 +83,8 @@ app.patch('/api/dispositivos', async (req, res) => {
             hum_max, 
             max_temp, 
             max_hum, 
-            sensor_porta_vinculado 
+            sensor_porta_vinculado,
+            em_manutencao
         } = req.body;
 
         if (!mac) return res.status(400).json({ error: 'MAC Obrigatório' });
@@ -94,6 +96,7 @@ app.patch('/api/dispositivos', async (req, res) => {
             temp_max: Number(temp_max !== undefined ? temp_max : (max_temp || null)),
             hum_max: Number(hum_max !== undefined ? hum_max : (max_hum || null)),
             sensor_porta_vinculado: sensor_porta_vinculado || null, 
+            em_manutencao: em_manutencao !== undefined ? em_manutencao : false,
             
             updated_at: new Date().toISOString()
         };
@@ -125,7 +128,7 @@ app.get('/api/sensores/latest', async (req, res) => {
         // 2. Busca Configurações
         const { data: configs, error: configError } = await supabase
             .from('sensor_configs')
-            .select('mac, display_name, sensor_porta_vinculado');
+            .select('mac, display_name, sensor_porta_vinculado, em_manutencao');
 
         // 3. Busca status das portas (View otimizada)
         const { data: doorLogs, error: doorError } = await supabase
@@ -163,7 +166,8 @@ app.get('/api/sensores/latest', async (req, res) => {
                 ...item,
                 display_name: config.display_name || 'Sensor Sem Nome',
                 sensor_porta_vinculado: macPortaVinculada || null,
-                status_porta: dadosPorta
+                status_porta: dadosPorta,
+                em_manutencao: !!config.em_manutencao
             };
         });
 
@@ -334,7 +338,8 @@ app.get('/api/sensores/:mac', async (req, res) => {
             display_name: 'Sensor Não Configurado',
             batt_warning: 20,
             temp_max: 0,
-            hum_max: 0
+            hum_max: 0,
+            em_manutencao: false
         };
 
         // --- ATUALIZAÇÃO IMPORTANTE ---
