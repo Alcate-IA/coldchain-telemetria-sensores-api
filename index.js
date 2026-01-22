@@ -245,33 +245,52 @@ app.get('/api/sensor/report', async (req, res) => {
 
 /**
  * GET /api/sensor/coordinates
- * Retorna coordenadas (lat, lng, alt) de um sensor em um período.
+ * Retorna coordenadas (lat, lng, alt) de um sensor.
+ * - Com startDate/endDate: Retorna histórico (caminho percorido).
+ * - Sem datas: Retorna apenas a ÚLTIMA posição conhecida.
  */
 app.get('/api/sensor/coordinates', async (req, res) => {
     try {
         const { mac, startDate, endDate } = req.query;
 
-        if (!mac || !startDate || !endDate) {
-            return res.status(400).json({ error: 'Faltam parâmetros: mac, startDate, endDate' });
+        // 1. Validação: Apenas MAC é estritamente obrigatório agora
+        if (!mac) {
+            return res.status(400).json({ error: 'O parâmetro "mac" é obrigatório.' });
         }
 
-        const { data, error } = await supabase
+        // Inicia a query base
+        let query = supabase
             .from('telemetry_logs')
             .select('*')
-            .eq('mac', mac)
-            .gte('ts', startDate)
-            .lte('ts', endDate)
-            .order('ts', { ascending: true });
+            .eq('mac', mac);
+
+        // 2. Decide a estratégia de busca
+        if (startDate && endDate) {
+            // MODO HISTÓRICO: Busca intervalo e ordena do mais antigo para o novo (caminho)
+            query = query
+                .gte('ts', startDate)
+                .lte('ts', endDate)
+                .order('ts', { ascending: true });
+        } else {
+            // MODO ÚLTIMA POSIÇÃO: Busca apenas o registro mais recente
+            query = query
+                .order('ts', { ascending: false })
+                .limit(1);
+        }
+
+        const { data, error } = await query;
 
         if (error) throw error;
 
-        const coordinates = data
+        // 3. Formata os dados
+        const coordinates = (data || [])
             .map(item => ({
                 ts: item.ts,
-                lat: item.latitude ?? item.lat,
+                lat: item.latitude ?? item.lat, // Suporte a campos legados
                 lng: item.longitude ?? item.lng,
                 alt: item.altitude ?? 0
             }))
+            // Filtra logs que não possuem coordenadas (evita pontos nulos no mapa)
             .filter(c => c.lat != null && c.lng != null);
 
         return res.status(200).json(coordinates);
