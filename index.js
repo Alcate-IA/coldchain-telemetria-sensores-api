@@ -20,17 +20,15 @@ app.use(cors());
 app.use(express.json());
 
 // ==================================================================
-// [NOVO] MIDDLEWARE DE LOG (LOGGER)
+// MIDDLEWARE DE LOG (LOGGER)
 // ==================================================================
-// Este bloco intercepta TODAS as requisições e imprime no console
 app.use((req, res, next) => {
     const timestamp = new Date().toLocaleString('pt-BR');
     console.log(`[${timestamp}] 📡 REQ: ${req.method} ${req.originalUrl}`);
-    // Opcional: Logar o corpo da requisição se for POST/PATCH
     if (['POST', 'PATCH'].includes(req.method)) {
         console.log(`   📦 Body:`, JSON.stringify(req.body));
     }
-    next(); // Passa para o próximo middleware (Autenticação)
+    next();
 });
 
 // --- MIDDLEWARE DE SEGURANÇA (API KEY) ---
@@ -38,8 +36,8 @@ const authMiddleware = (req, res, next) => {
     const userApiKey = req.header('x-api-key');
     const masterApiKey = process.env.API_KEY;
 
-    if (!userApiKey || userApiKey !== masterApiKey) {
-        // Log de tentativa falha
+    // Se não tiver API Key configurada no .env, libera (dev mode) ou bloqueia
+    if (masterApiKey && (!userApiKey || userApiKey !== masterApiKey)) {
         console.warn(`[!] Tentativa não autorizada: ${req.ip}`);
         return res.status(401).json({ 
             error: 'Acesso não autorizado. API Key inválida ou ausente.' 
@@ -52,7 +50,7 @@ app.use('/api', authMiddleware);
 
 
 // ==================================================================
-// ROTAS DE DISPOSITIVOS
+// ROTAS DE DISPOSITIVOS (CONFIGURAÇÕES)
 // ==================================================================
 
 app.get('/api/dispositivos', async (req, res) => {
@@ -69,13 +67,17 @@ app.get('/api/dispositivos', async (req, res) => {
             if (!acc.mapa.has(idUnico)) {
                 acc.mapa.add(idUnico);
                 const config = configMap.get(current.mac) || {};
+                
                 acc.lista.push({ 
                     gw: current.gw, 
                     mac: current.mac,
                     display_name: config.display_name || 'Novo Sensor',
-                    batt_warning: config.batt_warning || 20,
-                    max_temp: config.temp_max || 0,
-                    max_hum: config.hum_max || 0,
+                    batt_warning: config.batt_warning ==='' ? null : config.batt_warning,
+                    max_temp: config.temp_max ==='' ? null : config.temp_max,
+                    min_temp: config.temp_min ==='' ? null : config.temp_min,
+                    max_hum: config.hum_max ==='' ? null : config.hum_max,
+                    min_hum: config.hum_min ==='' ? null : config.hum_min,
+                    sensor_porta_vinculado: config.sensor_porta_vinculado || null, 
                     em_manutencao: !!config.em_manutencao
                 });
             }
@@ -91,22 +93,24 @@ app.get('/api/dispositivos', async (req, res) => {
 
 app.patch('/api/dispositivos', async (req, res) => {
     try {
-        const { 
-            mac, display_name, batt_warning, 
-            temp_max, hum_max, max_temp, max_hum, 
-            sensor_porta_vinculado, em_manutencao
+        const {
+            mac, display_name, batt_warning,
+            max_temp, min_temp, max_hum, min_hum,
+            sensor_porta_vinculado, maintenance_mode 
         } = req.body;
 
         if (!mac) return res.status(400).json({ error: 'MAC Obrigatório' });
 
         const payload = {
             mac: mac,
-            display_name: display_name,
-            batt_warning: Number(batt_warning || 20),
-            temp_max: Number(temp_max !== undefined ? temp_max : (max_temp || null)),
-            hum_max: Number(hum_max !== undefined ? hum_max : (max_hum || null)),
-            sensor_porta_vinculado: sensor_porta_vinculado || null, 
-            em_manutencao: em_manutencao !== undefined ? em_manutencao : false,
+            display_name: display_name ?? null,
+            batt_warning: batt_warning === '' ? null : Number(batt_warning),
+            temp_max: max_temp === '' ? null : Number(max_temp),
+            temp_min: min_temp === '' ? null : Number(min_temp),
+            hum_max: max_hum === '' ? null : Number(max_hum),
+            hum_min: min_hum === '' ? null : Number(min_hum),
+            sensor_porta_vinculado: sensor_porta_vinculado ?? null, 
+            em_manutencao: maintenance_mode !== undefined ? maintenance_mode : false,
             updated_at: new Date().toISOString()
         };
 
@@ -127,13 +131,18 @@ app.patch('/api/dispositivos', async (req, res) => {
 });
 
 // ==================================================================
-// ROTAS DE TELEMETRIA
+// ROTAS DE TELEMETRIA (DASHBOARD)
 // ==================================================================
 
 app.get('/api/sensores/latest', async (req, res) => {
     try {
+        // 1. Busca últimas leituras
         const { data: logs, error: logError } = await supabase.from('view_latest_telemetry').select('*');
-        const { data: configs, error: configError } = await supabase.from('sensor_configs').select('mac, display_name, sensor_porta_vinculado, em_manutencao');
+        
+        // 2. Busca configurações
+        const { data: configs, error: configError } = await supabase.from('sensor_configs').select('mac, display_name, em_manutencao');
+        
+        // 3. Busca último status de porta (Unificado: sensor_mac = mac do termômetro)
         const { data: doorLogs, error: doorError } = await supabase.from('view_latest_door_status').select('*');
 
         if (logError) throw logError;
@@ -145,21 +154,23 @@ app.get('/api/sensores/latest', async (req, res) => {
 
         const result = logs.map(item => {
             const config = configMap.get(item.mac) || {};
-            const macPortaVinculada = config.sensor_porta_vinculado;
+            
+            // CORREÇÃO AQUI: Usa o MAC do próprio sensor para achar o status da porta virtual
+            const statusPortaLog = doorMap.get(item.mac);
+            
             let dadosPorta = null;
-
-            if (macPortaVinculada) {
-                const statusPorta = doorMap.get(macPortaVinculada);
-                if (statusPorta) {
-                    dadosPorta = { is_open: statusPorta.is_open };
-                }
+            if (statusPortaLog) {
+                dadosPorta = {
+                    // Aqui estava o erro. Agora usamos a variável correta 'statusPortaLog'
+                    is_open: statusPortaLog.is_open,
+                    last_change: statusPortaLog.timestamp_read 
+                };
             }
 
             return {
-                ...item,
+                ...item, 
                 display_name: config.display_name || 'Sensor Sem Nome',
-                sensor_porta_vinculado: macPortaVinculada || null,
-                status_porta: dadosPorta,
+                status_porta: dadosPorta, 
                 em_manutencao: !!config.em_manutencao
             };
         });
@@ -176,15 +187,14 @@ app.get('/api/sensores/latest', async (req, res) => {
 app.get('/api/sensor/report', async (req, res) => {
     try {
         const { mac, startDate, endDate } = req.query;
-        
-        // Log específico para operações pesadas
         console.log(`📊 Gerando relatório Excel para: ${mac}`);
 
         if (!mac || !startDate || !endDate) {
             return res.status(400).json({ error: 'Faltam parâmetros: mac, startDate, endDate' });
         }
 
-        const { data, error } = await supabase
+        // Busca Telemetria
+        const { data: telemetryData, error: telemetryError } = await supabase
             .from('telemetry_logs')
             .select('*')
             .eq('mac', mac)
@@ -192,25 +202,47 @@ app.get('/api/sensor/report', async (req, res) => {
             .lte('ts', endDate)
             .order('ts', { ascending: true });
 
-        if (error) throw error;
+        if (telemetryError) throw telemetryError;
 
-        if (!data || data.length === 0) {
+        // Busca Eventos de Porta (Mesmo MAC agora)
+        const { data: doorData, error: doorError } = await supabase
+            .from('door_logs')
+            .select('*')
+            .eq('sensor_mac', mac)
+            .gte('timestamp_read', startDate)
+            .lte('timestamp_read', endDate)
+            .order('timestamp_read', { ascending: true });
+
+        if (!telemetryData || telemetryData.length === 0) {
             return res.status(404).json({ error: 'Nenhum dado encontrado para este período.' });
         }
 
-        const excelData = data.map(item => ({
+        const excelData = telemetryData.map(item => ({
+            "Tipo": "Leitura",
             "Data/Hora": new Date(item.ts).toLocaleString('pt-BR'),
             "Temperatura (°C)": item.temp,
             "Umidade (%)": item.hum,
             "Bateria (%)": item.batt,
             "Gateway": item.gw,
-            "RSSI (dBm)": item.rssi,
             "Sensor MAC": item.mac
         }));
 
-        const workSheet = XLSX.utils.json_to_sheet(excelData);
+        const excelDoorData = (doorData || []).map(item => ({
+            "Data/Hora": new Date(item.timestamp_read).toLocaleString('pt-BR'),
+            "Estado": item.is_open ? "ABERTO (Virtual)" : "FECHADO",
+            "Detalhe": item.is_open ? "Subida Brusca Temp" : "Resfriamento",
+            "Sensor MAC": item.sensor_mac
+        }));
+
         const workBook = XLSX.utils.book_new();
-        XLSX.utils.book_append_sheet(workBook, workSheet, "Relatorio");
+        
+        const sheetTemp = XLSX.utils.json_to_sheet(excelData);
+        XLSX.utils.book_append_sheet(workBook, sheetTemp, "Temperatura e Umidade");
+
+        if (excelDoorData.length > 0) {
+            const sheetDoor = XLSX.utils.json_to_sheet(excelDoorData);
+            XLSX.utils.book_append_sheet(workBook, sheetDoor, "Eventos de Porta");
+        }
 
         const buffer = XLSX.write(workBook, { type: 'buffer', bookType: 'xlsx' });
         const filename = `relatorio_${mac.replace(/:/g, '')}_${Date.now()}.xlsx`;
@@ -218,7 +250,7 @@ app.get('/api/sensor/report', async (req, res) => {
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
 
-        console.log(`✅ Relatório enviado com sucesso (${data.length} registros).`);
+        console.log(`✅ Relatório enviado com sucesso.`);
         return res.send(buffer);
 
     } catch (error) {
@@ -227,13 +259,11 @@ app.get('/api/sensor/report', async (req, res) => {
     }
 });
 
+// Coordenadas (Mantido)
 app.get('/api/sensor/coordinates', async (req, res) => {
     try {
         const { mac, startDate, endDate } = req.query;
-
-        if (!mac) {
-            return res.status(400).json({ error: 'O parâmetro "mac" é obrigatório.' });
-        }
+        if (!mac) return res.status(400).json({ error: 'MAC Obrigatório.' });
 
         let query = supabase.from('telemetry_logs').select('*').eq('mac', mac);
 
@@ -244,7 +274,6 @@ app.get('/api/sensor/coordinates', async (req, res) => {
         }
 
         const { data, error } = await query;
-
         if (error) throw error;
 
         const coordinates = (data || [])
@@ -257,9 +286,7 @@ app.get('/api/sensor/coordinates', async (req, res) => {
             .filter(c => c.lat != null && c.lng != null);
 
         return res.status(200).json(coordinates);
-
     } catch (error) {
-        console.error('Erro em coordenadas:', error.message);
         return res.status(500).json({ error: error.message });
     }
 });
@@ -296,6 +323,7 @@ app.get('/api/sensores/:mac', async (req, res) => {
 
         const rawLogs = logsResult.data || [];
         
+        // Filtro de Downsampling
         const filteredLogs = [];
         let lastKeptTime = 0;
         const TEN_MINUTES_MS = 10 * 60 * 1000;
@@ -311,9 +339,9 @@ app.get('/api/sensores/:mac', async (req, res) => {
         let sensorInfo = configResult.data || {
             mac: mac,
             display_name: 'Sensor Não Configurado',
-            batt_warning: 20,
-            temp_max: 0,
-            hum_max: 0,
+            batt_warning: 20, 
+            temp_max: null, temp_min: null,
+            hum_max: null, hum_min: null,
             em_manutencao: false
         };
 
@@ -330,14 +358,14 @@ app.get('/api/sensores/:mac', async (req, res) => {
         return res.status(200).json({ info: sensorInfo, history: filteredLogs });
 
     } catch (error) {
-        console.error(`Erro ao buscar histórico do sensor ${req.params.mac}:`, error.message);
+        console.error(`Erro histórico sensor ${req.params.mac}:`, error.message);
         return res.status(500).json({ error: error.message });
     }
 });
 
 
 // ==================================================================
-// ROTAS DE PORTAS (DOOR LOGS)
+// ROTAS DE PORTAS (DOOR LOGS) - UNIFICADO
 // ==================================================================
 
 app.get('/api/doors/latest', async (req, res) => {
@@ -345,21 +373,24 @@ app.get('/api/doors/latest', async (req, res) => {
         const { data: logs, error: logError } = await supabase.from('view_latest_door_status').select('*');
         if (logError) throw logError;
 
-        const { data: configs, error: configError } = await supabase.from('sensor_configs').select('sensor_mac');
-        const macsConfigurados = new Set(configs?.map(c => c.sensor_mac) || []);
+        const { data: configs, error: configError } = await supabase.from('sensor_configs').select('mac, display_name');
+        
+        // Mapa: MAC -> Nome da Câmara
+        const nameMap = new Map(configs?.map(c => [c.mac, c.display_name]) || []);
 
         const result = logs.map(log => {
-            const isKnown = macsConfigurados.has(log.sensor_mac);
+            const nomeAmigavel = nameMap.get(log.sensor_mac) || `Câmara ${log.sensor_mac}`;
+            
             return {
                 ...log,
-                display_name: `Porta ${log.sensor_mac}`, 
-                status_text: log.is_open ? 'ABERTO' : 'FECHADO',
+                display_name: nomeAmigavel,
+                status_text: log.is_open ? 'ABERTA (Virtual)' : 'FECHADO',
                 status_color: log.is_open ? 'red' : 'green',
-                is_configured: isKnown
+                is_configured: nameMap.has(log.sensor_mac) 
             };
         });
 
-        result.sort((a, b) => a.sensor_mac.localeCompare(b.sensor_mac));
+        result.sort((a, b) => a.display_name.localeCompare(b.display_name));
         return res.status(200).json(result);
 
     } catch (error) {
@@ -369,5 +400,5 @@ app.get('/api/doors/latest', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`🚀 API Rodando em http://localhost:${PORT}`);
+    console.log(`🚀 API Frontend Rodando em http://localhost:${PORT}`);
 });
