@@ -1,17 +1,19 @@
 {
   "name": "coldchain-telemetria-sensores-api",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "API para telemetria de sensores de cold chain com arquitetura em camadas",
+  "main": "src/index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Alcate-IA/coldchain-telemetria-sensores-api.git"
   },
-  "keywords": [],
+  "keywords": ["coldchain", "telemetria", "sensores", "iot", "api"],
   "author": "",
   "license": "ISC",
   "bugs": {
@@ -23,8 +25,13 @@
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
+    "express-rate-limit": "^7.1.5",
+    "express-validator": "^7.0.1",
+    "helmet": "^7.1.0",
+    "joi": "^17.11.0",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
+    "winston": "^3.11.0",
     "xlsx": "^0.18.5"
   }
 }
